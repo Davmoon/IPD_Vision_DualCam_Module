@@ -34,12 +34,12 @@ def picamera_generator(index):
 # Define the configurations for video file and webcam
 configurations = [
     {
-        "model_name": "yolov8n_relu6_coco--640x640_quant_hailort_hailo8l_1",
+        "model_name": "scooter_model",
         "source" : '0',
         "display_name": "cam0",
     },
     {
-        "model_name": "yolov8n_relu6_coco--640x640_quant_hailort_hailo8l_1",
+        "model_name": "scooter_model",
         "source" : '1',
         "display_name": "cam1",
     },
