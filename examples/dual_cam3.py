@@ -7,7 +7,8 @@ import time
 import requests
 import sys
 import os
-import datetime
+from datetime import datetime
+from gpiozero import MotionSensor
 
 # inference_host_address = "@cloud"
 inference_host_address = "@local"
@@ -25,6 +26,10 @@ SERVER_LINK = "https://davmo.xyz/upload"
 
 # 이미지 저장 폴더
 SAVE_DIR = "captures"
+
+#PIR 센서 핀
+PIR_PIN = 17
+pir = MotionSensor(PIR_PIN)
 
 # 저장 폴더 없으면 생성하도록
 if not os.path.exists(SAVE_DIR):
@@ -49,6 +54,7 @@ class NotificationGizmo(dgstreams.Gizmo):
         super().__init__([(10,)])
         self.camera_name = camera_name
         self.frame_count = 0
+        self.last_save_time = 0
 
     def run(self):
         #print(f"[{self.camera_name}]")
@@ -82,14 +88,15 @@ class NotificationGizmo(dgstreams.Gizmo):
                             self.save_and_send(result_wrapper.data, label, score)
                             self.last_save_time = time.time()
 
+            #시간 지날때마다 프레임 카운트해서 점 찍음(진행상황 파악.)
             self.frame_count += 1
-            if self.frame_count % 60 == 0:
+            if self.frame_count % 180 == 0:
                 print(".", end="", flush=True)
             
             self.send_result(result_wrapper)
 
+    #이미지를 저장하고 서버로 전송하는 함수
     def save_and_send(self, image_array, label, score):
-            """이미지를 저장하고 서버로 전송하는 함수"""
             try:
                 # 1. 파일명 생성 (예: captures/cam0_scooter_20231025_123001.jpg)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
