@@ -22,7 +22,7 @@ zoo_url = "../models"
 token = '' # leave empty for local inference
 
 # 이미지 전송 서버 주소
-SERVER_LINK = "https://davmo.xyz/upload"
+SERVER_LINK = "https://davmo.xyz/api/uploads"
 
 # 이미지 저장 폴더
 SAVE_DIR = "captures"
@@ -36,18 +36,54 @@ if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
 def picamera_generator(index):
-    picam2 = Picamera2(index)
-    config = picam2.create_preview_configuration(main={"size": (640, 480)}) 
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(1.0)
+    # picam2 = Picamera2(index)
+    # config = picam2.create_preview_configuration(main={"size": (640, 480)}) 
+    # picam2.configure(config)
+    # picam2.start()
+    # time.sleep(1.0)
+    print(f'-- {index}번 카메라 PIR 인식 대기중. 감지되면 카메라 시작--')
+    picam2 = None
+    active_until = 0
+    is_running = False
+
     try:
         while True:
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            yield frame_bgr
+            current_time = time.time()
+        
+            if pir.value:
+                if not is_running:
+                    print("-- PIR 움직임 감지. 카메라 부팅 --")
+                active_until = current_time + 20.0
+            
+            if current_time < active_until:
+                if not is_running:
+                    picam2 = Picamera2(index)
+                    config = picam2.create_preview_configuration(main={"size": (640, 480)})
+                    picam2.configure(config)
+                    picam2.start()
+                    is_running = True
+                    print()
+
+                frame_rgb = picam2.capture_array()
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                yield frame_bgr
+            else:
+                if is_running:
+                    print("1분 경과, 카메라 대기모드 전환")
+                    if picam2:
+                        picam2.stop()
+                        picam2.close()
+                        picam2 = None
+                    is_running=False
+
+                time.sleep(0.1)
+    except Exception as e:
+        print(f"오류 발생 : {e}")
     finally:
-        picam2.stop()
+        if picam2:
+            picam2.stop()
+            picam2.close()
+
 
 class NotificationGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
@@ -111,7 +147,7 @@ class NotificationGizmo(dgstreams.Gizmo):
                 # 이미지를 메모리상에서 jpg로 인코딩 (파일 다시 읽는 것보다 빠름)
                 _, img_encoded = cv2.imencode('.jpg', image_array)
                 files = {
-                    'file': (filename, img_encoded.tobytes(), 'image/jpeg')
+                    'imageFile': (filename, img_encoded.tobytes(), 'image/jpeg')
                 }
                 data = {
                     'camera': self.camera_name,
@@ -120,7 +156,7 @@ class NotificationGizmo(dgstreams.Gizmo):
                 }
                 
                 # 타임아웃 1초 설정 (서버가 응답 없어도 1초 뒤에 무시하고 계속 진행)
-                response = requests.post(SERVER_LINK, files=files, data=data, timeout=1.0)
+                response = requests.post(SERVER_LINK, files=files, data=data, timeout=10.0)
                 
                 if response.status_code == 200:
                     print(f"   📡 서버 전송 성공! (200 OK)")
@@ -167,4 +203,5 @@ pipeline = (
 )
 
 # start composition
+print("시스템 시작")
 dgstreams.Composition(*pipeline).start()
