@@ -8,7 +8,7 @@ import requests
 import sys
 import os
 from datetime import datetime
-from gpiozero import MotionSensor
+from gpiozero import MotionSensor, OutputDevice
 
 # inference_host_address = "@cloud"
 inference_host_address = "@local"
@@ -31,6 +31,12 @@ SAVE_DIR = "captures"
 PIR_PIN = 17
 pir = MotionSensor(PIR_PIN)
 
+#릴레이 모듈 핀
+relay = OutputDevice(27, active_high=True, initial_value=False)
+
+#PIR 대기시간 해제후 작동시간
+CAMERA_ACTION_TIME = 20.0
+
 # 저장 폴더 없으면 생성하도록
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
@@ -41,7 +47,7 @@ def picamera_generator(index):
     # picam2.configure(config)
     # picam2.start()
     # time.sleep(1.0)
-    print(f'-- {index}번 카메라 PIR 인식 대기중. 감지되면 카메라 시작--')
+    print(f'-- 2. {index}번 카메라 PIR 인식 대기중. 감지되면 카메라 시작--')
     picam2 = None
     active_until = 0
     is_running = False
@@ -52,28 +58,36 @@ def picamera_generator(index):
         
             if pir.value:
                 if not is_running:
-                    print("-- PIR 움직임 감지. 카메라 부팅 --")
-                active_until = current_time + 20.0
+                    print("-- 3. PIR 움직임 감지. 카메라 부팅 --")
+                active_until = current_time + CAMERA_ACTION_TIME
             
             if current_time < active_until:
+                #시간이 남았는데 켜지지 않았을 때
                 if not is_running:
                     picam2 = Picamera2(index)
                     config = picam2.create_preview_configuration(main={"size": (640, 480)})
                     picam2.configure(config)
                     picam2.start()
+
+                    print("-- 4. 고부 조명 동작--")
+                    relay.on()
                     is_running = True
-                    print()
 
                 frame_rgb = picam2.capture_array()
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 yield frame_bgr
+
             else:
+                #시간종료 이후에도 아직 동작중인 경우
                 if is_running:
-                    print("1분 경과, 카메라 대기모드 전환")
+                    print(f"-- 5. {CAMERA_ACTION_TIME}초 경과, {index}번 카메라 대기모드 전환 --")
                     if picam2:
                         picam2.stop()
                         picam2.close()
                         picam2 = None
+                    
+                    print("-- 6. 고부조명 꺼짐 --")
+                    relay.off()
                     is_running=False
 
                 time.sleep(0.1)
@@ -83,6 +97,7 @@ def picamera_generator(index):
         if picam2:
             picam2.stop()
             picam2.close()
+            relay.off()
 
 
 class NotificationGizmo(dgstreams.Gizmo):
@@ -203,5 +218,5 @@ pipeline = (
 )
 
 # start composition
-print("시스템 시작")
+print("1. 시스템 시작")
 dgstreams.Composition(*pipeline).start()
