@@ -9,6 +9,7 @@ import sys
 import os
 from datetime import datetime
 from gpiozero import MotionSensor, OutputDevice
+import threading
 
 # inference_host_address = "@cloud"
 inference_host_address = "@local"
@@ -32,7 +33,11 @@ PIR_PIN = 17
 pir = MotionSensor(PIR_PIN)
 
 #릴레이 모듈 핀
-relay = OutputDevice(27, active_high=True, initial_value=False)
+RELAY_PIN = 27
+relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
+
+# RFID 설정
+SERIAL_PORT = '/dev/ttyS0'
 
 #PIR 대기시간 해제후 작동시간
 CAMERA_ACTION_TIME = 20.0
@@ -80,7 +85,7 @@ def picamera_generator(index):
             else:
                 #시간종료 이후에도 아직 동작중인 경우
                 if is_running:
-                    print(f"-- 5. {CAMERA_ACTION_TIME}초 경과, {index}번 카메라 대기모드 전환 --")
+                    print(f"\n -- 5. {CAMERA_ACTION_TIME}초 경과, {index}번 카메라 대기모드 전환 --")
                     if picam2:
                         picam2.stop()
                         picam2.close()
@@ -136,7 +141,8 @@ class NotificationGizmo(dgstreams.Gizmo):
                         print(f"\n[{self.camera_name}] found. type:'{label}' ({score:.1f}%)", flush=True)
 
                         if time.time() - self.last_save_time > 2.0:
-                            self.save_and_send(result_wrapper.data, label, score)
+                            t = threading.Thread(target=self.save_and_send, args=(result_wrapper.data.copy(), label, score))
+                            t.start()
                             self.last_save_time = time.time()
 
             #시간 지날때마다 프레임 카운트해서 점 찍음(진행상황 파악.)
