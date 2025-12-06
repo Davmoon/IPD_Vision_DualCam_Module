@@ -14,7 +14,6 @@ from gpiozero import OutputDevice
 from flask import Flask, jsonify
 import urllib3
 
-# HTTPS 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- [사용자 설정] ---
@@ -25,11 +24,11 @@ token = ''
 SERVER_LINK = "https://davmo.xyz/api/uploads" 
 SAVE_DIR = "captures"
 
-# [중요] 본인의 RFID 태그 ID
+# [중요] 타겟 태그 ID
 TARGET_RFID_TAG = "E2000017570D0173277006CB" 
 
 # 하드웨어 설정
-SERIAL_PORT = '/dev/ttyAMA0' # 안되면 /dev/ttyS0 확인
+SERIAL_PORT = '/dev/ttyAMA0'
 BAUD_RATE = 115200
 RELAY_PIN = 27
 relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
@@ -37,13 +36,15 @@ relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-# --- [상태 관리 클래스 (수정됨)] ---
+# --- [상태 관리 클래스] ---
 class SystemState:
     def __init__(self):
+        # 상태 목록:
+        # "IDLE": 아무것도 안 함 (평소)
+        # "WAIT_FOR_TAG": 웹 요청 받음 -> 올바른 태그 기다리는 중
+        # "CAPTURING": 태그 확인됨 -> 카메라 켜고 촬영 중
         self.mode = "IDLE" 
-        self.rfid_data = None
-        self.finished_count = 0      # [추가] 촬영 완료한 카메라 수
-        self.lock = threading.Lock() # [추가] 동기화용 잠금장치
+        self.rfid_data = None 
 
 state = SystemState()
 
@@ -53,73 +54,79 @@ app = Flask(__name__)
 @app.route('/return_start', methods=['GET', 'POST'])
 def start_return_process():
     if state.mode == "IDLE":
-        print("\n📱 [Web] 반납 요청 수신! RFID 태깅 대기...")
-        state.mode = "SCANNING" 
-        return jsonify({"status": "ok", "message": "반납 모드 시작."})
+        print("\n📱 [Web] 반납 요청 수신! 태그 인증 대기 중...")
+        state.mode = "WAIT_FOR_TAG" # 이제부터 태그가 맞는지 검사 시작
+        return jsonify({"status": "ok", "message": "태그를 리더기에 대주세요."})
+    elif state.mode == "WAIT_FOR_TAG":
+        return jsonify({"status": "waiting", "message": "이미 태그를 기다리고 있습니다."})
     else:
-        return jsonify({"status": "busy", "message": "이미 작동 중입니다."})
+        return jsonify({"status": "busy", "message": "시스템이 작동 중입니다."})
 
 def run_flask():
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-# --- [2. RFID 리더 스레드] ---
+# --- [2. RFID 리더 스레드 (상시 가동)] ---
 def rfid_reader_thread():
-    print(f"📡 RFID 리더 대기 중... ({SERIAL_PORT})")
+    print(f"📡 RFID 리더 상시 가동 중... ({SERIAL_PORT})")
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
         cmd_read = bytes.fromhex('BB 00 22 00 00 22 7E')
         
         while True:
-            # SCANNING 모드일 때만 명령 전송
-            if state.mode == "SCANNING":
-                ser.write(cmd_read)
-                time.sleep(0.05)
-                
-                if ser.in_waiting > 0:
-                    data = ser.read(ser.in_waiting)
-                    hex_str = data.hex().upper()
-                    
-                    if len(data) > 8 and hex_str.startswith("BB"):
-                        if TARGET_RFID_TAG in hex_str:
-                            print(f"✅ [RFID] 인증 성공! 카메라를 켭니다.")
-                            
-                            # [핵심 수정] 촬영 시작 전 카운터 초기화
-                            with state.lock:
-                                state.finished_count = 0
-                                state.rfid_data = TARGET_RFID_TAG
-                                state.mode = "CAPTURING"
+            # [변경] 조건문 없이 항상 읽습니다.
+            ser.write(cmd_read)
+            time.sleep(0.05) # 반응 속도 빠름
             
-            time.sleep(0.1) 
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting)
+                hex_str = data.hex().upper()
+                
+                if len(data) > 8 and hex_str.startswith("BB"):
+                    # 태그가 읽혔음!
+                    
+                    # [로직] 웹에서 요청이 왔을 때만("WAIT_FOR_TAG") 반응
+                    if state.mode == "WAIT_FOR_TAG":
+                        # ID 추출 (16~40번째 글자)
+                        # (혹시 추출이 불안하면 전체 문자열 검색으로 변경 가능)
+                        try:
+                            # 만약 추출이 어렵다면 아래 줄 주석하고 if TARGET in hex_str: 사용
+                            # current_epc = hex_str[16:40] 
+                            
+                            if TARGET_RFID_TAG in hex_str:
+                                print(f"\n✅ [RFID] 인증 성공! ({TARGET_RFID_TAG})")
+                                print("   --> 카메라 부팅 시작!")
+                                state.rfid_data = TARGET_RFID_TAG
+                                state.mode = "CAPTURING" # 카메라 깨우기
+                            else:
+                                # 다른 태그가 읽힘 (로그가 너무 많으면 주석 처리)
+                                # print(f"⚠️ [RFID] 미등록 태그 감지")
+                                pass
+                        except: pass
+            
+            time.sleep(0.05)
 
     except Exception as e:
         print(f"❌ RFID 오류: {e}")
 
 # --- [3. 카메라 제너레이터] ---
 def picamera_generator(index):
-    print(f'-- {index}번 카메라 준비 완료 --')
+    print(f'-- 2. {index}번 카메라 대기 모드 --')
     picam2 = None
     is_running = False
 
     try:
         while True:
+            # CAPTURING 모드가 되면 카메라 켜기
             if state.mode == "CAPTURING":
                 if not is_running:
-                    print(f"📷 [{index}번] 카메라 ON")
-                    try:
-                        picam2 = Picamera2(index)
-                        config = picam2.create_preview_configuration(main={"size": (640, 480)})
-                        picam2.configure(config)
-                        picam2.start()
-                        
-                        # 0번 카메라가 대표로 조명을 켭니다 (중복 방지)
-                        if index == 0: relay.on()
-                        
-                        is_running = True
-                        time.sleep(1.0) # 노출 안정화
-                    except Exception as e:
-                        print(f"❌ [{index}번] 켜기 실패: {e}")
-                        yield None # 에러 시 빈 데이터 보냄
-                        continue
+                    print("-- 3. 카메라 ON --")
+                    picam2 = Picamera2(index)
+                    config = picam2.create_preview_configuration(main={"size": (640, 480)})
+                    picam2.configure(config)
+                    picam2.start()
+                    relay.on()
+                    is_running = True
+                    time.sleep(1.0) 
 
                 frame_rgb = picam2.capture_array()
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -127,59 +134,43 @@ def picamera_generator(index):
 
             else:
                 if is_running:
-                    print(f"💤 [{index}번] 카메라 OFF")
+                    print("-- 5. 카메라 OFF --")
                     if picam2:
                         picam2.stop()
                         picam2.close()
                         picam2 = None
-                    if index == 0: relay.off()
+                    relay.off()
                     is_running = False
                 time.sleep(0.1)
 
     except Exception as e:
-        print(f"제너레이터 오류({index}): {e}")
+        print(f"카메라 오류: {e}")
     finally:
         if picam2: picam2.stop(); picam2.close()
         relay.off()
 
-# --- [4. 촬영 및 전송 Gizmo (동기화 로직 적용)] ---
+# --- [4. 촬영 및 전송 Gizmo] ---
 class CaptureGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
         super().__init__([(10,)])
         self.camera_name = camera_name
-        self.has_shot = False # 내가 찍었는지 확인하는 깃발
 
     def run(self):
         for result_wrapper in self.get_input(0):
             if self._abort: break
             
-            # 모드가 바뀌면 깃발 초기화 (다음 촬영 준비)
-            if state.mode != "CAPTURING":
-                self.has_shot = False
-
-            # 촬영 모드이고, 나는 아직 안 찍었다면?
-            if state.mode == "CAPTURING" and not self.has_shot:
+            # 카메라가 켜졌고(CAPTURING), 이미지가 들어옴 -> 바로 촬영
+            if state.mode == "CAPTURING":
                 print(f"\n📸 [{self.camera_name}] 찰칵! 전송 시작...")
                 image = result_wrapper.data
                 
-                # 전송 스레드 시작
                 t = threading.Thread(target=self.save_and_send_thread, 
                                      args=(image.copy(), state.rfid_data))
                 t.start()
 
-                # [중요] "나 찍었어요" 표시
-                self.has_shot = True
-
-                # [핵심 로직] 다 찍었는지 확인
-                with state.lock:
-                    state.finished_count += 1
-                    print(f"   --> 진행률: {state.finished_count} / {len(configurations)}")
-                    
-                    # 모든 카메라(2대)가 다 찍었으면 그때 종료!
-                    if state.finished_count >= len(configurations):
-                        print("🔄 모든 카메라 촬영 완료! 대기 모드로 복귀.")
-                        state.mode = "IDLE"
-                        state.rfid_data = None
+                print("🔄 상태 초기화: 다시 대기합니다.")
+                state.mode = "IDLE" # 초기화
+                state.rfid_data = None
             
             self.send_result(result_wrapper)
 
@@ -196,18 +187,20 @@ class CaptureGizmo(dgstreams.Gizmo):
                 'status': 'return_complete'
             }
             
-            # verify=False 추가 (HTTPS 에러 방지)
-            requests.post(SERVER_LINK, files=files, data=data, timeout=15.0, verify=False)
-            print(f"   ✅ [{self.camera_name}] 전송 완료!")
+            # 타임아웃 15초
+            response = requests.post(SERVER_LINK, files=files, data=data, timeout=15.0, verify=False)
+            
+            if response.status_code == 200:
+                print(f"   ✅ 전송 성공!")
+            else:
+                print(f"   ⚠️ 전송 실패 (Code: {response.status_code})")
 
         except Exception as e:
-            print(f"   ❌ [{self.camera_name}] 전송 오류: {e}")
+            print(f"   ❌ 전송 오류: {e}")
 
 # --- [메인 실행] ---
-# [수정] 2개 카메라 모두 활성화
 configurations = [
     { "model_name": "scooter_model", "source" : '0', "display_name": "cam0" },
-    { "model_name": "scooter_model", "source" : '1', "display_name": "cam1" },
 ]
 
 models = [
@@ -231,7 +224,7 @@ threading.Thread(target=run_flask, daemon=True).start()
 threading.Thread(target=rfid_reader_thread, daemon=True).start()
 
 print("==================================================")
-print(f"🚀 2채널 반납 시스템 가동! (동시 촬영)")
+print(f"🚀 시스템 시작! (RFID 상시 가동 중)")
 print("==================================================")
 
 dgstreams.Composition(*pipeline).start()
