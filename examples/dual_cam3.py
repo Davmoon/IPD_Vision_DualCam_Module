@@ -1,5 +1,4 @@
 import degirum as dg
-import degirum_tools
 import degirum_tools.streams as dgstreams
 from picamera2 import Picamera2
 import cv2
@@ -38,6 +37,8 @@ BAUD_RATE = 115200
 PIR_PIN = 17
 RELAY_PIN = 27
 
+AI_SAME_RATE = 50.0
+
 pir = MotionSensor(PIR_PIN)
 relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
 
@@ -53,6 +54,7 @@ class SystemState:
         self.finished_count = 0 
         self.lock = threading.Lock()
         self.relay_off_time = 0.0
+        self.request_id = None
 
 state = SystemState()
 
@@ -72,16 +74,17 @@ def relay_manager_thread():
 
 # [스레드 2] PIR 센서 (보안등)
 def pir_monitor_thread():
-    print(f"🏃 PIR 감시 시작 ({PIR_PIN}번)")
+    print(f"🏃 PIR 감시 시작")
     while True:
         if pir.value:
             extend_relay(30.0) # 움직임 감지 시 조명 30초
         time.sleep(0.2)
 
-# --- [스레드 3] MQTT 클라이언트 (Flask 대체) ---
+# --- [스레드 3] MQTT 클라이언트 ---
 def run_mqtt_thread():
+
     def on_connect(client, userdata, flags, rc):
-        print(f"📡 MQTT 브로커 연결 성공! (Topic: {MQTT_TOPIC})")
+        print(f"📡 MQTT 브로커 연결됨. (Topic: {MQTT_TOPIC})")
         client.subscribe(MQTT_TOPIC)
 
     def on_message(client, userdata, msg):
@@ -238,19 +241,21 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                                 inf_result = item; break
                     except: pass
 
-                # 2. 결과 분석 (스쿠터 >= 80%)
+                # 2. 결과 분석
                 if inf_result and inf_result.results:
                     for obj in inf_result.results:
                         label = obj.get('label', '')
                         score = obj.get('score', 0) * 100
 
-                        # [조건 충족!]
-                        if 'scooter' in label and score >= 80.0:
-                            print(f"\n🎯 [{self.camera_name}] 스쿠터 확인됨! ({score:.1f}%) -> 찰칵!")
+                        # 조건이 충족될 시 요
+                        if 'scooter' in label and score >= AI_SAME_RATE:
+                            print(f"\n🎯 [{self.camera_name}]촬영 성공. 일치율:({score:.1f}%)")
                             
                             # 전송 스레드 실행
                             t = threading.Thread(target=self.save_and_send_thread, 
-                                                 args=(result_wrapper.data.copy(), state.rfid_data))
+                                                 args=(result_wrapper.data.copy(),
+                                                       state.rfid_data,
+                                                       state.request_id))
                             t.start()
 
                             self.has_shot = True 
@@ -261,22 +266,28 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                                 print(f"   --> 진행률: {state.finished_count} / {len(configurations)}")
                                 
                                 if state.finished_count >= len(configurations):
-                                    print("🔄 미션 완료! 대기 모드로 복귀.")
+
+                                    print("🔄동작 완료. 대기 모드로 복귀.")
                                     state.mode = "IDLE"
                                     state.rfid_data = None
+                                    state.request_id = None
                             
                             break 
             
             self.send_result(result_wrapper)
 
-    def save_and_send_thread(self, image_array, rfid_data):
+    def save_and_send_thread(self, image_array, rfid_data, req_id):
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"{self.camera_name}_RETURN_{timestamp}.jpg"
             
             _, img_encoded = cv2.imencode('.jpg', image_array)
             files = {'imageFile': (filename, img_encoded.tobytes(), 'image/jpeg')}
-            data = {'camera': self.camera_name, 'rfid': rfid_data, 'status': 'return_complete'}
+            data = {'camera': self.camera_name,
+                    'rfid': rfid_data,
+                    'status': 'return_complete',
+                    'requestId': req_id
+                    }
             
             requests.post(SERVER_LINK, files=files, data=data, timeout=15.0, verify=False)
             print(f"   ✅ [{self.camera_name}] 전송 완료!")
