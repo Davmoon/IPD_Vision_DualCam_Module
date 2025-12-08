@@ -13,6 +13,7 @@ from datetime import datetime
 from gpiozero import MotionSensor, OutputDevice
 import urllib3
 import paho.mqtt.client as mqtt # [변경] Flask 대신 MQTT 사용
+import json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -29,7 +30,7 @@ TARGET_RFID_TAG = "E2000017570D0173277006CB"
 
 # [MQTT 설정]
 BROKER_ADDRESS = "broker.emqx.io"  
-MQTT_TOPIC = "gmatch/camera/trigger"
+MQTT_TOPIC = "davmo/gmatch/camera/trigger"
 
 # 하드웨어 핀
 SERIAL_PORT = '/dev/ttyAMA0'
@@ -84,22 +85,39 @@ def run_mqtt_thread():
         client.subscribe(MQTT_TOPIC)
 
     def on_message(client, userdata, msg):
-        payload = msg.payload.decode()
-        # print(f"📩 MQTT 수신: {payload}")
-        
-        # 'start' 명령이 오면 반납 프로세스 시작
-        if payload == 'start':
-            if state.mode == "IDLE":
-                print("\n📱 [MQTT] 반납 요청 수신! RFID 태그를 대주세요...")
-                state.mode = "WAIT_FOR_TAG" # 1단계: 태그 대기 상태로 전환
-            elif state.mode == "WAIT_FOR_TAG":
-                print("⚠️ 이미 태그를 기다리고 있습니다.")
-            else:
-                print(f"⚠️ 시스템이 이미 작동 중입니다. (상태: {state.mode})")
+        try:
+            # 1. 메시지 디코딩
+            payload_str = msg.payload.decode()
+            print(f"DEBUG: Topic={msg.topic}, Payload={payload_str}")
+            
+            # 2. JSON 파싱
+            try:
+                data = json.loads(payload_str)
+                command = data.get('command')
+                req_id = data.get('requestId')
+            except json.JSONDecodeError:
+                # 혹시 JSON이 아니라 그냥 'start' 문자열만 올 경우를 대비
+                command = payload_str
+                req_id = "unknown"
 
+            # 3. 로직 처리
+            if command == 'start':
+                if state.mode == "IDLE":
+                    print(f"\n📱 [MQTT] 반납 요청 수신! (ID: {req_id}) RFID 태그를 대주세요...")
+                    
+                    # [중요] 서버가 보낸 requestId를 저장해둬야 나중에 응답할 수 있습니다.
+                    state.request_id = req_id 
+                    state.mode = "WAIT_FOR_TAG" # 태그 대기 상태로 전환
+                    
+                elif state.mode == "WAIT_FOR_TAG":
+                    print("⚠️ 이미 태그를 기다리고 있습니다.")
+                else:
+                    print(f"⚠️ 시스템이 이미 작동 중입니다. (상태: {state.mode})")
+                    
+        except Exception as e:
+            print(f"❌ 메시지 처리 중 오류 발생: {e}")
+            
     # MQTT 클라이언트 설정 (버전 호환성을 위해 기본값 사용)
-    # paho-mqtt v2.0 이상일 경우 CallbackAPIVersion 설정이 필요할 수 있으나
-    # 기본 호환 모드로 시도합니다.
     try:
         client = mqtt.Client() 
     except:
