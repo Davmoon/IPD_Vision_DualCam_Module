@@ -10,12 +10,10 @@ import os
 import threading
 import serial
 from datetime import datetime
-from gpiozero import MotionSensor, OutputDevice
+from gpiozero import MotionSensor, OutputDevice, Buzzer
 import urllib3
 import paho.mqtt.client as mqtt
 import json
-
-# [추가] NeoPixel 라이브러리
 import board
 import neopixel
 
@@ -41,6 +39,7 @@ SERIAL_PORT = '/dev/ttyAMA0'
 BAUD_RATE = 115200
 PIR_PIN = 17
 RELAY_PIN = 27
+BUZZER_PIN = 22
 
 # [추가] NeoPixel 설정
 LED_PIN = board.D18  # GPIO 18
@@ -51,9 +50,8 @@ AI_SAME_RATE = 50.0
 
 pir = MotionSensor(PIR_PIN)
 relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
+buzzer = Buzzer(BUZZER_PIN)
 
-# [추가] NeoPixel 객체 생성
-# (sudo 권한이 없으면 여기서 에러가 날 수 있음)
 try:
     pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS, auto_write=False)
 except Exception as e:
@@ -77,6 +75,17 @@ class SystemState:
 
 state = SystemState()
 
+def play_buzzer(count):
+    def _beep():
+        for _ in range(count):
+            buzzer.on()
+            time.sleep(0.1) # 삐
+            buzzer.off()
+            time.sleep(0.1) # 멈춤
+    
+    # 메인 로직이 멈추지 않도록 별도 스레드에서 소리 재생
+    threading.Thread(target=_beep, daemon=True).start()
+
 def extend_relay(seconds):
     target_time = time.time() + seconds
     if target_time > state.relay_off_time:
@@ -93,18 +102,24 @@ def relay_manager_thread():
 
 # [스레드 2] PIR 센서
 def pir_monitor_thread():
-    # print(f"🏃 PIR 감시 시작")
     while True:
         if pir.value:
             extend_relay(30.0) 
         time.sleep(0.2)
 
-# [추가 스레드] LED 상태 표시 관리자
+def color_wipe(color, wait):
+    """LED가 하나씩 순서대로 켜지는 효과"""
+    for i in range(LED_COUNT):
+        pixels[i] = color
+        pixels.show()
+        time.sleep(wait)
+
+# LED 상태 표시 관리자
 def led_manager_thread():
     if not pixels:
         return
 
-    print("💡 NeoPixel LED 제어 시작 (GPIO 18)")
+    print("NeoPixel LED 제어 시작 (GPIO 18)")
     
     def set_color(color):
         pixels.fill(color)
@@ -113,21 +128,21 @@ def led_manager_thread():
     while True:
         # 시스템 상태(state.mode)에 따라 LED 색상 변경
         
+        # idle 상태
         if state.mode == "IDLE":
-            # 평소: 꺼짐 (또는 아주 희미한 흰색 (5,5,5))
-            set_color((0, 0, 0))
+            set_color((0, 255, 105))
             time.sleep(0.5)
 
+        # 대기중
         elif state.mode == "WAIT_FOR_TAG":
-            # 대기 중: 파란색 깜빡임
-            set_color((0, 0, 255)) # Blue
+            color_wipe((0, 0, 255), 0.1) # Blue
             time.sleep(0.5)
             set_color((0, 0, 0))   # Off
             time.sleep(0.5)
 
+        #촬영 처리중
         elif state.mode == "CAPTURING":
-            # 촬영/처리 중: 빨간색 고정 (또는 회전 효과)
-            set_color((255, 0, 0)) # Red
+            color_wipe((255, 0, 0), 0.1) # Red
             time.sleep(0.1)
         
         # 완료 신호(SUCCESS)는 Gizmo에서 잠시 딜레이를 주지 않으면 순식간에 지나가서 안 보임
@@ -199,6 +214,8 @@ def rfid_reader_thread():
                     if state.mode == "WAIT_FOR_TAG":
                         if TARGET_RFID_TAG in hex_str:
                             print(f"\n[RFID] 인증 성공. 카메라 기동")
+
+                            play_buzzer(1)
                             
                             if pixels:
                                 pixels.fill((0, 255, 0))
@@ -217,47 +234,50 @@ def rfid_reader_thread():
 
 # --- [5. 카메라 제너레이터] ---
 def picamera_generator(index):
-    print(f'-- {index}번 카메라 준비 완료 --')
+    print(f'-- {index}번 카메라 초기화 및 대기 중 (Hot Standby) --')
+    
+    # [수정] 카메라 객체 생성 및 시작을 루프 밖에서 한 번만 수행
     picam2 = None
-    is_running = False
-
     try:
-        while True:
-            if state.mode == "CAPTURING":
-                if not is_running:
-                    print(f"[{index}번] 카메라 ON")
-                    try:
-                        picam2 = Picamera2(index)
-                        config = picam2.create_preview_configuration(main={"size": (640, 480)})
-                        picam2.configure(config)
-                        picam2.start()
-                        
-                        extend_relay(20.0) 
-                        is_running = True
-                        time.sleep(1.0 + (index * 0.5)) 
-                    except Exception as e:
-                        print(f"[{index}번] 실패: {e}")
-                        yield None 
-                        continue
+        picam2 = Picamera2(index)
+        # 해상도 설정 (AI 모델에 맞춰 최적화)
+        config = picam2.create_preview_configuration(main={"size": (640, 480)})
+        picam2.configure(config)
+        picam2.start() # 카메라는 계속 켜둡니다.
+        
+        print(f"📷 [{index}번] 하드웨어 준비 완료.")
 
+        while True:
+            # [조건] 촬영 모드일 때만 프레임을 AI로 전송
+            if state.mode == "CAPTURING":
+                
+                # 조명 켜기 (지속적으로 시간 연장)
+                extend_relay(1.0) 
+                
+                # 프레임 캡처 및 전송
                 frame_rgb = picam2.capture_array()
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 yield frame_bgr
-
+                
             else:
-                if is_running:
-                    print(f"[{index}번] 카메라 OFF")
-                    if picam2:
-                        picam2.stop()
-                        picam2.close()
-                        picam2 = None
-                    is_running = False
+                # [IDLE 상태]
+                # 카메라는 켜져있지만, AI로 데이터를 보내지 않고 쉽니다.
+                # CPU 사용량을 낮추기 위해 대기
                 time.sleep(0.1)
 
     except Exception as e:
-        print(f"제너레이터 오류({index}): {e}")
+        print(f"❌ [{index}번] 카메라 치명적 오류: {e}")
+        # 에러 발생 시 안전하게 닫기
+        if picam2:
+            try:
+                picam2.stop()
+                picam2.close()
+            except: pass
+            
     finally:
-        if picam2: picam2.stop(); picam2.close()
+        if picam2:
+            picam2.stop()
+            picam2.close()
 
 # --- [6. 스마트 촬영 Gizmo] ---
 class SmartCaptureGizmo(dgstreams.Gizmo):
@@ -275,23 +295,23 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
 
             if state.mode == "CAPTURING" and not self.has_shot:
                 
-                inf_result = None
-                if hasattr(result_wrapper.data, 'result'):
-                    inf_result = result_wrapper.data
-                else:
-                    try:
-                        for item in result_wrapper.meta._meta_list:
-                            if hasattr(item, 'results'):
-                                inf_result = item; break
-                    except: pass
+                # inf_result = None
+                # if hasattr(result_wrapper.data, 'result'):
+                #     inf_result = result_wrapper.data
+                # else:
+                #     try:
+                #         for item in result_wrapper.meta._meta_list:
+                #             if hasattr(item, 'results'):
+                #                 inf_result = item; break
+                #     except: pass
 
-                if inf_result and inf_result.results:
-                    for obj in inf_result.results:
-                        label = obj.get('label', '')
-                        score = obj.get('score', 0) * 100
+                # if inf_result and inf_result.results:
+                #     for obj in inf_result.results:
+                #         label = obj.get('label', '')
+                #         score = obj.get('score', 0) * 100
 
-                        if 'scooter' in label and score >= 80.0: # (AI_SAME_RATE 대신 80.0 사용)
-                            print(f"\n[{self.camera_name}] 스쿠터 확인됨({score:.1f}%) 사진 촬영")
+                #         if 'scooter' in label and score >= 80.0: # (AI_SAME_RATE 대신 80.0 사용)
+                #             print(f"\n[{self.camera_name}] 스쿠터 확인됨({score:.1f}%) 사진 촬영")
                             
                             t = threading.Thread(target=self.save_and_send_thread, 
                                                  args=(result_wrapper.data.copy(),
@@ -307,6 +327,8 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                                 
                                 if state.finished_count >= len(configurations):
                                     
+                                    play_buzzer(2)
+
                                     # [LED 효과] 완료 시 초록색 2초 유지 후 꺼짐
                                     if pixels:
                                         pixels.fill((0, 255, 0)) # Green
@@ -320,7 +342,7 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                                     state.rfid_data = None
                                     state.request_id = None
                             
-                            break 
+                            #break 
             
             self.send_result(result_wrapper)
 
