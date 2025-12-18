@@ -20,34 +20,31 @@ from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==========================================
-# [사용자 설정: 로직 제어 변수]
-# ==========================================
-# 1. AI 점수 체크를 할 것인가? (False면 타임아웃/딜레이 기반 촬영)
+# AI 점수 체크
 CONF_USE_AI_CHECK = False  
 
-# 2. (AI 미사용 시) 카메라 켜진 후 몇 초 뒤에 찍을 것인가? (로딩 시간)
+# AI 사용x, 카메라 찍고 보내기전 기다릴 시간.
 CONF_FORCE_CAPTURE_DELAY = 4.0 
 
-# 3. (AI 사용 시) 시간이 지나면 강제로 전송할 것인가? (Watchdog)
+# 강제 전송
 CONF_USE_WATCHDOG = True  
 
-# 4. 강제 전송까지 기다릴 시간 (초) - AI 사용 시 적용
+# 강제 전송 대기 시간
 CONF_WATCHDOG_TIME = 8.0  
 
-# 5. AI 인식 합격점
+# AI 인식 합격점
 AI_THRESHOLD = 0.80
 
-# ==========================================
-# [사용자 설정: 기본]
-# ==========================================
+# 사용자 설정: 기본
 inference_host_address = "@local"
 zoo_url = "../models"
 token = '' 
 
 SERVER_LINK = "https://davmo.xyz/api/uploads" 
 SAVE_DIR = "captures"
-TARGET_RFID_TAG = "E2000017570D0173277006CB" 
+TARGET_RFID_TAG = "E200471440F06821485A010F" 
+# TARGET_RFID_TAG = "E2000017570D0173277006CB" 
+# E200471440306821484E010D
 
 BROKER_ADDRESS = "broker.emqx.io" 
 MQTT_TOPIC_TRIGGER = "davmo/gmatch/camera/trigger"
@@ -66,9 +63,7 @@ LED_BRIGHTNESS = 0.1
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-# ==========================================
-# [전역 상태 관리]
-# ==========================================
+# 전역 상태 관리
 class SystemState:
     def __init__(self):
         self.mode = "IDLE" 
@@ -86,9 +81,7 @@ class SystemState:
 state = SystemState()
 stop_event = threading.Event()
 
-# ==========================================
-# [하드웨어 초기화]
-# ==========================================
+# 하드웨어 초기화
 pir = MotionSensor(PIR_PIN)
 relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
 mqtt_client = None
@@ -99,9 +92,7 @@ except: buzzer = None
 try: pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS, auto_write=False)
 except: pixels = None
 
-# ==========================================
-# [헬퍼 함수]
-# ==========================================
+# 헬퍼 함수
 def log(tag, msg):
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] [{tag}] {msg}")
@@ -134,9 +125,7 @@ def extend_relay(seconds):
     if target_time > state.relay_off_time:
         state.relay_off_time = target_time
 
-# ==========================================
-# [스레드 1: 릴레이 & 시스템 보호]
-# ==========================================
+# 릴레이, 시스템 보호 thread
 def relay_manager_thread():
     log("THREAD", "Relay Manager Started")
     while not stop_event.is_set():
@@ -161,13 +150,11 @@ def relay_manager_thread():
                 if buzzer: buzzer.value = 0.5; time.sleep(0.5); buzzer.value = 0
         time.sleep(0.1)
 
-# ==========================================
-# [스레드 2: PIR 및 LED]
-# ==========================================
+# PIR, LED thread
 def pir_monitor_thread():
     while not stop_event.is_set():
         try:
-            if pir.value: extend_relay(5.0) 
+            if pir.value: extend_relay(3.0) 
         except: break
         time.sleep(0.2)
 
@@ -190,7 +177,7 @@ def led_manager_thread():
             current_led_mode = state.mode
 
         if state.mode == "IDLE":
-            color_wipe((0, 255, 105), 0.05)
+            color_wipe((0, 255, 25), 0.05)
             time.sleep(0.1)
         elif state.mode == "WAIT_FOR_TAG":
             set_color((0, 0, 255)); time.sleep(0.5)
@@ -200,9 +187,8 @@ def led_manager_thread():
         else:
             time.sleep(0.1)
 
-# ==========================================
-# [스레드 3: MQTT]
-# ==========================================
+
+#  MQTT thread
 def run_mqtt_thread():
     log("THREAD", "MQTT Started")
     def on_connect(client, userdata, flags, rc):
@@ -228,9 +214,7 @@ def run_mqtt_thread():
         while not stop_event.is_set(): mqtt_client.loop(0.1)
     except: pass
 
-# ==========================================
 # [스레드 4: RFID 리더]
-# ==========================================
 def rfid_reader_thread():
     log("THREAD", "RFID Reader Started")
     try:
@@ -260,9 +244,7 @@ def rfid_reader_thread():
     finally:
         if 'ser' in locals() and ser.is_open: ser.close()
 
-# ==========================================
-# [5. 카메라 제너레이터 (IDLE=OFF)]
-# ==========================================
+#  카메라 제너레이터
 def picamera_generator(index):
     time.sleep(index * 0.5)
     log("CAM", f"Camera {index} Thread Ready")
@@ -316,9 +298,8 @@ def picamera_generator(index):
     finally:
         stop_camera(picam2)
 
-# ==========================================
-# [6. 스마트 Gizmo (로직 제어 적용)]
-# ==========================================
+
+# 로직 제어
 class SmartCaptureGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
         super().__init__([(10,)])
