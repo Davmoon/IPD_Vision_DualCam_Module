@@ -21,7 +21,22 @@ from concurrent.futures import ThreadPoolExecutor
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# [사용자 설정]
+# [사용자 설정: 로직 제어]
+# ==========================================
+# 1. AI 점수 체크를 할 것인가? (False면 RFID 찍자마자 무조건 전송)
+CONF_USE_AI_CHECK = True  
+
+# 2. 시간이 지나면 강제로 전송할 것인가? (Watchdog)
+CONF_USE_WATCHDOG = True  
+
+# 3. 강제 전송까지 기다릴 시간 (초)
+CONF_WATCHDOG_TIME = 8.0  
+
+# 4. AI 인식 합격점 (이 점수 넘으면 즉시 전송)
+AI_THRESHOLD = 0.80
+
+# ==========================================
+# [사용자 설정: 기본]
 # ==========================================
 inference_host_address = "@local"
 zoo_url = "../models"
@@ -44,9 +59,6 @@ BUZZER_PIN = 22
 LED_PIN = board.D18 
 LED_COUNT = 14 
 LED_BRIGHTNESS = 0.1 
-
-# [설정] AI 인식 임계값 (이 점수 넘을 때만 전송)
-AI_THRESHOLD = 0.40
 
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
@@ -120,7 +132,7 @@ def extend_relay(seconds):
         state.relay_off_time = target_time
 
 # ==========================================
-# [스레드 1: 릴레이 (타임아웃 로직 완전히 제거됨)]
+# [스레드 1: 릴레이 & 시스템 보호]
 # ==========================================
 def relay_manager_thread():
     log("THREAD", "Relay Manager Started")
@@ -130,7 +142,21 @@ def relay_manager_thread():
         else:
             if relay.value: relay.off()
             
-        # [삭제됨] 15초 하드 리셋 로직 제거 -> 무한 대기 가능
+        # [시스템 보호용 하드 리셋] 
+        # 설정된 Watchdog 시간 + 10초 여유를 줘도 안 끝나면 시스템 리셋 (안전장치)
+        if state.mode == "CAPTURING":
+            elapsed = time.time() - state.capture_start_time
+            # Watchdog을 안 쓰더라도 60초 이상 걸리면 뭔가 꼬인 것
+            limit = CONF_WATCHDOG_TIME + 10.0 if CONF_USE_WATCHDOG else 60.0
+            
+            if elapsed > limit:
+                log("WATCHDOG", f"🚨 System Stuck ({elapsed:.1f}s). Hard Reset.")
+                with state.lock:
+                    state.mode = "IDLE"
+                    state.rfid_data = None
+                    state.completed_cameras.clear()
+                    state.reset_flags = [True, True]
+                if buzzer: buzzer.value = 0.5; time.sleep(0.5); buzzer.value = 0
         time.sleep(0.1)
 
 # ==========================================
@@ -233,7 +259,7 @@ def rfid_reader_thread():
         if 'ser' in locals() and ser.is_open: ser.close()
 
 # ==========================================
-# [5. 카메라 제너레이터 (IDLE=OFF, CAPTURING=ON)]
+# [5. 카메라 제너레이터 (IDLE=OFF)]
 # ==========================================
 def picamera_generator(index):
     time.sleep(index * 0.5)
@@ -272,7 +298,7 @@ def picamera_generator(index):
                         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                         extend_relay(1.0)
                         yield frame_bgr
-                        time.sleep(0.01) # 30fps
+                        time.sleep(0.01) 
                     except:
                         time.sleep(0.1)
                 else:
@@ -289,7 +315,7 @@ def picamera_generator(index):
         stop_camera(picam2)
 
 # ==========================================
-# [6. 스마트 Gizmo (수정됨: 구방식 데이터 추출 + 무한대기)]
+# [6. 스마트 Gizmo (설정 변수 적용)]
 # ==========================================
 class SmartCaptureGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
@@ -304,51 +330,57 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
         for result_wrapper in self.get_input(0):
             if stop_event.is_set(): break
             
+            # CAPTURING 모드이고, 완료되지 않은 카메라만 진입
             if state.mode == "CAPTURING" and (self.camera_name not in state.completed_cameras):
                 
-                # ====================================================
-                # [데이터 추출: 사용자님의 구 방식 복구]
-                # ====================================================
+                # ----------------------------------------------------
+                # [데이터 추출] (구 방식 유지)
+                # ----------------------------------------------------
                 inf_result = None
-                
-                # 1. wrapper.data에 직접 result가 있는지 확인
                 if hasattr(result_wrapper.data, 'result'):
                     inf_result = result_wrapper.data
                 else:
-                    # 2. meta_list 순회
                     try:
                         for item in result_wrapper.meta._meta_list:
                             if hasattr(item, 'results'):
-                                inf_result = item
-                                break
+                                inf_result = item; break
                     except: pass
                 
-                # 점수 계산
                 max_score = 0.0
-                
                 if inf_result and hasattr(inf_result, 'results'):
                     for obj in inf_result.results:
-                        # 딕셔너리 or 객체 속성 처리
                         score = obj.get('score', 0) if isinstance(obj, dict) else getattr(obj, 'score', 0)
+                        if score > max_score: max_score = score
                         
-                        if score > max_score:
-                            max_score = score
-
-                        # 로그 출력 (인식된 게 있으면 무조건 찍음)
                         if score > 0.4:
                             label = obj.get('label', '') if isinstance(obj, dict) else getattr(obj, 'label', '')
                             log("AI", f"[{self.camera_name}] Found: {label} ({score*100:.1f}%)")
 
-                # ====================================================
-                # [전송 결정: 타임아웃 없이 무한 대기]
-                # ====================================================
+                # ----------------------------------------------------
+                # [전송 결정 로직 - 설정 변수 적용]
+                # ----------------------------------------------------
+                elapsed = time.time() - state.capture_start_time
                 should_send = False
                 
-                # 80% 이상 확신할 때만 전송 (시간 제한 없음)
-                if max_score >= AI_THRESHOLD:
-                    log("GIZMO", f"[{self.camera_name}] 📸 PASS! ({max_score:.2f})")
+                # A. AI 체크 로직
+                if CONF_USE_AI_CHECK:
+                    # AI 점수가 임계값을 넘으면 전송
+                    if max_score >= AI_THRESHOLD:
+                        log("GIZMO", f"[{self.camera_name}] 📸 AI Pass! ({max_score:.2f})")
+                        should_send = True
+                else:
+                    # AI 체크를 껐으면 -> 무조건 전송 (즉시)
+                    # log("GIZMO", f"[{self.camera_name}] 📸 Instant Shot (AI Check OFF)")
                     should_send = True
-                    
+
+                # B. Watchdog (강제 전송) 로직
+                if CONF_USE_WATCHDOG:
+                    # 시간이 설정값을 넘으면 강제 전송
+                    if elapsed >= CONF_WATCHDOG_TIME:
+                        log("GIZMO", f"[{self.camera_name}] ⏰ Watchdog Timeout ({elapsed:.1f}s)! Force Capture.")
+                        should_send = True
+                
+                # 전송 실행
                 if should_send:
                     success = self.send_image_sync(result_wrapper.data, state.rfid_data, state.request_id)
                     if success:
@@ -358,7 +390,6 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                             if len(state.completed_cameras) >= state.total_cameras:
                                 self.finish_sequence()
             
-            # 다음 단계로 전달
             self.send_result(result_wrapper)
 
     def send_image_sync(self, img, rfid, req_id):
@@ -419,7 +450,7 @@ if __name__ == "__main__":
     ]
     for t in threads: t.start()
 
-    log("MAIN", "System Started (No Timeout, Wait for AI > 80%)")
+    log("MAIN", f"System Started (AI={CONF_USE_AI_CHECK}, WD={CONF_USE_WATCHDOG}@{CONF_WATCHDOG_TIME}s)")
 
     pipeline_obj = dgstreams.Composition(*pipeline)
 
