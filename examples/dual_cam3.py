@@ -21,18 +21,21 @@ from concurrent.futures import ThreadPoolExecutor
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# [사용자 설정: 로직 제어]
+# [사용자 설정: 로직 제어 변수]
 # ==========================================
-# 1. AI 점수 체크를 할 것인가? (False면 RFID 찍자마자 무조건 전송)
-CONF_USE_AI_CHECK = True  
+# 1. AI 점수 체크를 할 것인가? (False면 타임아웃/딜레이 기반 촬영)
+CONF_USE_AI_CHECK = False  
 
-# 2. 시간이 지나면 강제로 전송할 것인가? (Watchdog)
+# 2. (AI 미사용 시) 카메라 켜진 후 몇 초 뒤에 찍을 것인가? (로딩 시간)
+CONF_FORCE_CAPTURE_DELAY = 4.0 
+
+# 3. (AI 사용 시) 시간이 지나면 강제로 전송할 것인가? (Watchdog)
 CONF_USE_WATCHDOG = True  
 
-# 3. 강제 전송까지 기다릴 시간 (초)
+# 4. 강제 전송까지 기다릴 시간 (초) - AI 사용 시 적용
 CONF_WATCHDOG_TIME = 8.0  
 
-# 4. AI 인식 합격점 (이 점수 넘으면 즉시 전송)
+# 5. AI 인식 합격점
 AI_THRESHOLD = 0.80
 
 # ==========================================
@@ -142,11 +145,10 @@ def relay_manager_thread():
         else:
             if relay.value: relay.off()
             
-        # [시스템 보호용 하드 리셋] 
-        # 설정된 Watchdog 시간 + 10초 여유를 줘도 안 끝나면 시스템 리셋 (안전장치)
+        # [시스템 보호용 하드 리셋]
         if state.mode == "CAPTURING":
             elapsed = time.time() - state.capture_start_time
-            # Watchdog을 안 쓰더라도 60초 이상 걸리면 뭔가 꼬인 것
+            # Watchdog 시간보다 10초 더 지나면 리셋
             limit = CONF_WATCHDOG_TIME + 10.0 if CONF_USE_WATCHDOG else 60.0
             
             if elapsed > limit:
@@ -165,7 +167,7 @@ def relay_manager_thread():
 def pir_monitor_thread():
     while not stop_event.is_set():
         try:
-            if pir.value: extend_relay(30.0) 
+            if pir.value: extend_relay(5.0) 
         except: break
         time.sleep(0.2)
 
@@ -315,7 +317,7 @@ def picamera_generator(index):
         stop_camera(picam2)
 
 # ==========================================
-# [6. 스마트 Gizmo (설정 변수 적용)]
+# [6. 스마트 Gizmo (로직 제어 적용)]
 # ==========================================
 class SmartCaptureGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
@@ -362,23 +364,26 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                 elapsed = time.time() - state.capture_start_time
                 should_send = False
                 
-                # A. AI 체크 로직
                 if CONF_USE_AI_CHECK:
-                    # AI 점수가 임계값을 넘으면 전송
+                    # A. AI 체크 모드 (80% 이상 전송)
                     if max_score >= AI_THRESHOLD:
                         log("GIZMO", f"[{self.camera_name}] 📸 AI Pass! ({max_score:.2f})")
                         should_send = True
-                else:
-                    # AI 체크를 껐으면 -> 무조건 전송 (즉시)
-                    # log("GIZMO", f"[{self.camera_name}] 📸 Instant Shot (AI Check OFF)")
-                    should_send = True
-
-                # B. Watchdog (강제 전송) 로직
-                if CONF_USE_WATCHDOG:
-                    # 시간이 설정값을 넘으면 강제 전송
-                    if elapsed >= CONF_WATCHDOG_TIME:
-                        log("GIZMO", f"[{self.camera_name}] ⏰ Watchdog Timeout ({elapsed:.1f}s)! Force Capture.")
+                    
+                    # Watchdog (강제 전송)
+                    if CONF_USE_WATCHDOG and elapsed >= CONF_WATCHDOG_TIME:
+                        log("GIZMO", f"[{self.camera_name}] ⏰ Watchdog Timeout ({elapsed:.1f}s)!")
                         should_send = True
+                        
+                else:
+                    # B. 무조건 촬영 모드 (3초 딜레이 후 전송)
+                    # 카메라 켜지고 안정화될 시간을 줌
+                    if elapsed >= CONF_FORCE_CAPTURE_DELAY:
+                        log("GIZMO", f"[{self.camera_name}] 📸 Timer Capture ({elapsed:.1f}s)")
+                        should_send = True
+                    else:
+                        # 3초가 안 지났으면 아직 기다림 (화면만 나옴)
+                        pass
                 
                 # 전송 실행
                 if should_send:
@@ -450,7 +455,7 @@ if __name__ == "__main__":
     ]
     for t in threads: t.start()
 
-    log("MAIN", f"System Started (AI={CONF_USE_AI_CHECK}, WD={CONF_USE_WATCHDOG}@{CONF_WATCHDOG_TIME}s)")
+    log("MAIN", f"System Started (AI={CONF_USE_AI_CHECK}, Delay={CONF_FORCE_CAPTURE_DELAY}s)")
 
     pipeline_obj = dgstreams.Composition(*pipeline)
 
