@@ -17,6 +17,7 @@ import json
 import board
 import neopixel
 import signal
+from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -27,47 +28,38 @@ token = ''
 
 SERVER_LINK = "https://davmo.xyz/api/uploads" 
 SAVE_DIR = "captures"
+TARGET_RFID_TAG = "E2000017570D0173277006CB" 
 
-# RFID 태그 ID
-TARGET_RFID_TAG = "E200471439B0682147E60113" 
-
-# MQTT 설정
 BROKER_ADDRESS = "broker.emqx.io"  
-MQTT_TOPIC = "davmo/gmatch/camera/trigger"
+MQTT_TOPIC_TRIGGER = "davmo/gmatch/camera/trigger"
+MQTT_TOPIC_COMPLETE = "davmo/gmatch/camera/complete"
 
-# 하드웨어 핀 설정
 SERIAL_PORT = '/dev/ttyAMA0'
 BAUD_RATE = 115200
 PIR_PIN = 17
 RELAY_PIN = 27
 BUZZER_PIN = 22
-
-# [추가] NeoPixel 설정
-LED_PIN = board.D18  # GPIO 18
-LED_COUNT = 14       # LED 바의 개수 (사용하는 제품에 맞게 수정하세요! 보통 8개)
-LED_BRIGHTNESS = 0.1 # 밝기 (0.0 ~ 1.0)
+LED_PIN = board.D18  
+LED_COUNT = 14       
+LED_BRIGHTNESS = 0.1 
 
 AI_SAME_RATE = 50.0
 
 mqtt_client = None
-
 pir = MotionSensor(PIR_PIN)
 relay = OutputDevice(RELAY_PIN, active_high=True, initial_value=False)
-
 stop_event = threading.Event()
 
-# TonalBuzzer는 주파수를 입력받아 소리를 냅니다.
-# frequency=2000 : 2kHz (일반적인 삐 소리)
 try:
     buzzer = PWMOutputDevice(BUZZER_PIN, frequency=2000, initial_value=0)
 except Exception as e:
-    print(f"부저 초기화 실패: {e}")
+    print(f"⚠️ Buzzer Init Failed: {e}")
     buzzer = None
 
 try:
     pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS, auto_write=False)
 except Exception as e:
-    print(f"NeoPixel 초기화 실패 : {e}")
+    print(f"⚠️ NeoPixel Init Failed: {e}")
     pixels = None
 
 if not os.path.exists(SAVE_DIR):
@@ -76,107 +68,149 @@ if not os.path.exists(SAVE_DIR):
 # --- [전역 상태 관리] ---
 class SystemState:
     def __init__(self):
-        # 상태: IDLE -> WAIT_FOR_TAG -> CAPTURING
         self.mode = "IDLE" 
         self.rfid_data = None
         self.finished_count = 0 
         self.lock = threading.Lock()
         self.relay_off_time = 0.0
         self.request_id = None
-        self.led_status = "IDLE" # IDLE, WAITING, BUSY, SUCCESS
+        self.led_status = "IDLE"
+        self.capture_start_time = 0 
+        
+        # [핵심] 카메라별 재부팅 플래그 분리 (0번용, 1번용)
+        self.reset_flags = [False, False]
 
 state = SystemState()
 
+# --- [로그 헬퍼] ---
+def log(tag, msg):
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] [{tag}] {msg}")
+
+# --- [기능 함수들] ---
 def play_buzzer(count):
     if not buzzer: return
-
     def _beep():
         for _ in range(count):
-            # 수동 부저는 duty cycle 0.5(50%)일 때 가장 소리가 큽니다.
+            if stop_event.is_set(): break
             buzzer.value = 0.5 
-            time.sleep(0.15) # 소리 지속
-            buzzer.value = 0   # 끄기
-            time.sleep(0.1)  # 간격
-    
-    # 메인 로직이 멈추지 않도록 별도 스레드에서 소리 재생
+            time.sleep(0.15) 
+            buzzer.value = 0   
+            time.sleep(0.1)  
     threading.Thread(target=_beep, daemon=True).start()
+
+def play_finish_sound():
+    if not buzzer: return
+    def _sequence():
+        for _ in range(2):
+            if stop_event.is_set(): return
+            buzzer.value = 0.5
+            time.sleep(0.15)
+            buzzer.value = 0
+            time.sleep(0.1)
+        time.sleep(1.0) 
+        for _ in range(3):
+            if stop_event.is_set(): return
+            buzzer.value = 0.5
+            time.sleep(0.15)
+            buzzer.value = 0
+            time.sleep(0.1)
+    threading.Thread(target=_sequence, daemon=True).start()
 
 def extend_relay(seconds):
     target_time = time.time() + seconds
     if target_time > state.relay_off_time:
         state.relay_off_time = target_time
 
-# [스레드 1] 릴레이 관리자
+# --- [스레드 1: 릴레이 & 와치독] ---
 def relay_manager_thread():
+    log("THREAD", "Relay Manager Started")
     while not stop_event.is_set():
+        # 릴레이 제어
         if time.time() < state.relay_off_time:
             if not relay.value: relay.on()
         else:
             if relay.value: relay.off()
+            
+        # [와치독: 타임아웃 감지 및 복구 명령]
+        if state.mode == "CAPTURING":
+            elapsed = time.time() - state.capture_start_time
+            # 12초가 지나도 안 끝나면 리셋 (네트워크 지연 고려)
+            if elapsed > 12.0:
+                log("WATCHDOG", f"🚨 TIMEOUT ({elapsed:.1f}s)! Triggering Camera Reset.")
+                
+                with state.lock:
+                    state.mode = "IDLE"
+                    state.rfid_data = None
+                    state.request_id = None
+                    state.finished_count = 0
+                    # 두 카메라 모두에게 재부팅 지시
+                    state.reset_flags = [True, True]
+                
+                if buzzer:
+                    buzzer.value = 0.5
+                    time.sleep(0.5)
+                    buzzer.value = 0
         time.sleep(0.1)
 
-# [스레드 2] PIR 센서
+# --- [스레드 2: PIR 센서] ---
 def pir_monitor_thread():
     while not stop_event.is_set():
         try:
             if pir.value:
-                extend_relay(30.0)
+                extend_relay(30.0) 
         except Exception:
             break
         time.sleep(0.2)
 
+# --- [LED 효과] ---
 def color_wipe(color, wait):
-    """LED가 하나씩 순서대로 켜지는 효과"""
     for i in range(LED_COUNT):
-        pixels[i] = color
-        pixels.show()
+        if stop_event.is_set(): return
+        if pixels:
+            pixels[i] = color
+            pixels.show()
         time.sleep(wait)
 
-# LED 상태 표시 관리자
 def led_manager_thread():
-    if not pixels:
-        return
-
-    print("NeoPixel LED 제어 시작 (GPIO 18)")
+    if not pixels: return
+    log("THREAD", "LED Manager Started")
     
     def set_color(color):
         pixels.fill(color)
         pixels.show()
 
+    current_led_mode = ""
+
     while not stop_event.is_set():
-        # 시스템 상태(state.mode)에 따라 LED 색상 변경
-        
-        # idle 상태
+        if current_led_mode != state.mode:
+            current_led_mode = state.mode
+
         if state.mode == "IDLE":
             color_wipe((0, 255, 105), 0.1)
             time.sleep(0.5)
-
-        # 대기중
         elif state.mode == "WAIT_FOR_TAG":
-            set_color((0, 0, 255)) # Blue
+            set_color((0, 0, 255)) 
             time.sleep(0.5)
-            set_color((0, 0, 0))   # Off
+            set_color((0, 0, 0))   
             time.sleep(0.5)
-
-        #촬영 처리중
         elif state.mode == "CAPTURING":
-            set_color((255, 0, 0)) # Red
+            set_color((255, 0, 0)) 
             time.sleep(0.1)
-        
-        # 완료 신호(SUCCESS)는 Gizmo에서 잠시 딜레이를 주지 않으면 순식간에 지나가서 안 보임
-        # 여기서는 state.mode 위주로 처리
+            
     set_color((0,0,0))
 
-# --- [스레드 3] MQTT 클라이언트 ---
+# --- [스레드 3: MQTT] ---
 def run_mqtt_thread():
+    log("THREAD", "MQTT Thread Started")
     def on_connect(client, userdata, flags, rc):
-        print(f"-- MQTT 브로커 연결됨. (Topic: {MQTT_TOPIC}) --")
-        client.subscribe(MQTT_TOPIC)
+        log("MQTT", f"Connected (rc={rc})")
+        client.subscribe(MQTT_TOPIC_TRIGGER)
 
     def on_message(client, userdata, msg):
         try:
             payload_str = msg.payload.decode()
-            print(f"DEBUG: Topic={msg.topic}, Payload={payload_str}")
+            log("MQTT", f"Received: {payload_str}")
             
             try:
                 data = json.loads(payload_str)
@@ -188,173 +222,209 @@ def run_mqtt_thread():
 
             if command == 'start':
                 if state.mode == "IDLE":
-                    print(f"\n-- [MQTT] 반납 요청 수신! (ID: {req_id})-- ")
+                    log("MQTT", f"Start Command Accepted (ID: {req_id})")
                     play_buzzer(1)
                     state.request_id = req_id 
                     state.mode = "WAIT_FOR_TAG"
                 elif state.mode == "WAIT_FOR_TAG":
-                    print("-- 이미 태그를 기다리고 있습니다. --")
+                    log("MQTT", "⚠️ Ignored: Already waiting for tag")
                 else:
-                    print(f"-- 시스템이 이미 작동 중입니다. (상태: {state.mode}) --")
-                    
+                    log("MQTT", f"⚠️ Ignored: System busy ({state.mode})")
         except Exception as e:
-            print(f"-- 메시지 처리 중 오류 발생: {e} --")
+            log("MQTT", f"Message Error: {e}")
 
+    global mqtt_client
     try:
-        client = mqtt.Client() 
+        mqtt_client = mqtt.Client() 
     except:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-    client.on_connect = on_connect
-    client.on_message = on_message
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
 
-    print("-- MQTT 접속 시도 중... --")
+    log("MQTT", "Connecting to broker...")
     try:
-        client.connect(BROKER_ADDRESS, 1883, 60)
-        client.loop_forever()
+        mqtt_client.connect(BROKER_ADDRESS, 1883, 60)
+        while not stop_event.is_set():
+            mqtt_client.loop(0.1)
     except Exception as e:
-        print(f"-- MQTT 연결 오류: {e} --")
+        log("MQTT", f"Connection Failed: {e}")
 
-# --- [스레드 4] RFID 리더 ---
+# --- [스레드 4: RFID 리더] ---
 def rfid_reader_thread():
-    print(f"-- RFID 리더 대기 중... ({SERIAL_PORT}) --")
+    log("THREAD", "RFID Reader Started")
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
         cmd_read = bytes.fromhex('BB 00 22 00 00 22 7E')
         
-        while True:
+        while not stop_event.is_set():
+            ser.reset_input_buffer()
             ser.write(cmd_read)
-            time.sleep(0.01)
+            data = ser.read(32) 
             
-            if ser.in_waiting > 0:
-                data = ser.read(ser.in_waiting)
+            if len(data) > 8:
                 hex_str = data.hex().upper()
-                
-                if len(data) > 8 and hex_str.startswith("BB"):
+                if hex_str.startswith("BB"):
                     if state.mode == "WAIT_FOR_TAG":
                         if TARGET_RFID_TAG in hex_str:
-                            print(f"\n[RFID] 인증 성공. 카메라 기동")
-
-                            play_buzzer(2)
-                            time.sleep(0.5)
+                            log("RFID", "✅ Tag Detected! Starting Capture.")
+                            
+                            play_buzzer(1) 
+                            if pixels:
+                                pixels.fill((0, 255, 0))
+                                pixels.show()
+                                time.sleep(0.5)
 
                             with state.lock:
                                 state.finished_count = 0
                                 state.rfid_data = TARGET_RFID_TAG
                                 state.mode = "CAPTURING"
-            
-            time.sleep(0.01)
+                                state.capture_start_time = time.time() 
 
     except Exception as e:
-        print(f"-- RFID 오류: {e} --")
+        log("RFID", f"Error: {e}")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
 
-# --- [5. 카메라 제너레이터] ---
+# --- [5. 카메라 제너레이터 (핵심: 순차 재부팅 + 부하 분산)] ---
 def picamera_generator(index):
-    print(f'-- {index}번 카메라 초기화 및 대기 중 (Hot Standby) --')
-    
-    # [수정] 카메라 객체 생성 및 시작을 루프 밖에서 한 번만 수행
+    # [부팅 충돌 방지] 0.5초 간격으로 순차 실행
+    time.sleep(index * 0.5)
+    log("CAM_GEN", f"Initializing Camera {index} (Staggered Start)")
     picam2 = None
+
+    def start_camera():
+        p = Picamera2(index)
+        config = p.create_preview_configuration(main={"size": (640, 480)})
+        p.configure(config)
+        p.start()
+        return p
+
     try:
-        picam2 = Picamera2(index)
-        # 해상도 설정 (AI 모델에 맞춰 최적화)
-        config = picam2.create_preview_configuration(main={"size": (640, 480)})
-        picam2.configure(config)
-        picam2.start() # 카메라는 계속 켜둡니다.
-        
-        print(f"-- [{index}번] 하드웨어 준비 완료. --")
+        picam2 = start_camera()
+        log("CAM_GEN", f"✅ Camera {index} Ready")
 
         while not stop_event.is_set():
-            # [조건] 촬영 모드일 때만 프레임을 AI로 전송
-            frame_rgb = picam2.capture_array()
-
-            if state.mode == "CAPTURING":
-                
-                # 조명 켜기 (지속적으로 시간 연장)
-                extend_relay(1.0) 
-                
-                # 프레임 캡처 및 전송
-                frame_rgb = picam2.capture_array()
-                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                yield frame_bgr
-                
-            else:
-                # [IDLE 상태]
-                # 카메라는 켜져있지만, AI로 데이터를 보내지 않고 쉽니다.
-                # CPU 사용량을 낮추기 위해 대기
-                pass
-
-    except Exception as e:
-        print(f"-- [{index}번] 카메라 치명적 오류: {e} --")
-        # 에러 발생 시 안전하게 닫기
-        if picam2:
-            try:
-                picam2.stop()
-                picam2.close()
-            except: pass
             
+            # [복구 로직] 내 전용 리셋 플래그 확인
+            if state.reset_flags[index]:
+                log("CAM_GEN", f"⚠️ Camera {index} Resetting...")
+                
+                # 1. 끄기
+                if picam2:
+                    try: picam2.stop(); picam2.close()
+                    except: pass
+                picam2 = None
+                
+                # 2. 대기 (재부팅 시에도 순차 실행)
+                time.sleep(1.0 + (index * 0.5)) 
+                
+                # 3. 켜기
+                try:
+                    picam2 = start_camera()
+                    log("CAM_GEN", f"✅ Camera {index} Recovered!")
+                    # [중요] 내 할 일 끝났으므로 내 플래그만 내림 (무한 루프 방지)
+                    state.reset_flags[index] = False 
+                except Exception as e:
+                    log("CAM_GEN", f"❌ Camera {index} Recovery Failed: {e}")
+                    state.reset_flags[index] = False
+
+            # [촬영 로직]
+            try:
+                if picam2:
+                    frame_rgb = picam2.capture_array()
+                    
+                    if state.mode == "CAPTURING":
+                        extend_relay(1.0) 
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        yield frame_bgr
+                        # [중요] 0.03초 대기 (전력 부하 분산)
+                        time.sleep(0.03) 
+                    else:
+                        # IDLE 상태일 때
+                        time.sleep(0.01)
+            except Exception as e:
+                log("CAM_GEN", f"⚠️ Camera {index} Frame Error: {e}")
+                time.sleep(0.1)
+    
+    except Exception as e:
+        log("CAM_GEN", f"❌ Camera {index} Fatal Error: {e}")
     finally:
         if picam2:
-            picam2.stop()
-            picam2.close()
+            try: picam2.stop(); picam2.close()
+            except: pass
 
-# --- [6. 스마트 촬영 Gizmo] ---
+# --- [6. 스마트 촬영 Gizmo (스레드 풀 + 세션)] ---
 class SmartCaptureGizmo(dgstreams.Gizmo):
     def __init__(self, camera_name):
         super().__init__([(10,)])
         self.camera_name = camera_name
         self.has_shot = False 
+        # 동시 전송 제한 (2개) 및 연결 재사용
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.session = requests.Session()
+        self.session.verify = False
 
     def run(self):
+        log("GIZMO", f"[{self.camera_name}] Started")
         for result_wrapper in self.get_input(0):
-            if self._abort: break
+            if stop_event.is_set() or self._abort: break
             
             if state.mode != "CAPTURING":
-                self.has_shot = False
+                if self.has_shot:
+                    self.has_shot = False
 
             if state.mode == "CAPTURING" and not self.has_shot:
+                log("GIZMO", f"[{self.camera_name}] 📸 Triggered!")
                 
-                # inf_result = None
-                # if hasattr(result_wrapper.data, 'result'):
-                #     inf_result = result_wrapper.data
-                # else:
-                #     try:
-                #         for item in result_wrapper.meta._meta_list:
-                #             if hasattr(item, 'results'):
-                #                 inf_result = item; break
-                #     except: pass
+                self.executor.submit(self.save_and_send_thread, 
+                                     result_wrapper.data.copy(),
+                                     state.rfid_data,
+                                     state.request_id)
 
-                # if inf_result and inf_result.results:
-                #     for obj in inf_result.results:
-                #         label = obj.get('label', '')
-                #         score = obj.get('score', 0) * 100
+                self.has_shot = True 
+                
+                with state.lock:
+                    state.finished_count += 1
+                    log("GIZMO", f"Progress: {state.finished_count} / {len(configurations)}")
+                    
+                    if state.finished_count >= len(configurations):
+                        log("GIZMO", "✅ All Cameras Finished!")
+                        play_finish_sound()
 
-                #         if 'scooter' in label and score >= 80.0: # (AI_SAME_RATE 대신 80.0 사용)
-                #             print(f"\n[{self.camera_name}] 스쿠터 확인됨({score:.1f}%) 사진 촬영")
-                            
-                            t = threading.Thread(target=self.save_and_send_thread, 
-                                                 args=(result_wrapper.data.copy(),
-                                                       state.rfid_data,
-                                                       state.request_id))
-                            t.start()
+                        if pixels:
+                            pixels.fill((0, 255, 0)) 
+                            pixels.show()
+                            time.sleep(2.0)
+                            pixels.fill((0, 0, 0))
+                            pixels.show()
 
-                            self.has_shot = True 
-                            
-                            with state.lock:
-                                state.finished_count += 1
-                                print(f"진행률: {state.finished_count} / {len(configurations)}")
-                                
-                                if state.finished_count >= len(configurations):
-                                    
-                                    play_buzzer(3)
+                        self.send_complete_mqtt()
 
-                                    print("모든 작업 완료. 대기 모드 전환")
-                                    state.mode = "IDLE"
-                                    state.rfid_data = None
-                                    state.request_id = None
-                            
-                            #break 
+                        log("GIZMO", "Returning to IDLE")
+                        state.mode = "IDLE"
+                        state.rfid_data = None
+                        state.request_id = None
             
             self.send_result(result_wrapper)
+            
+        self.executor.shutdown(wait=False)
+        self.session.close()
+
+    def send_complete_mqtt(self):
+        try:
+            if mqtt_client:
+                payload = json.dumps({
+                    "command": "complete",
+                    "requestId": state.request_id,
+                    "status": "success",
+                    "message": "Upload complete"
+                })
+                mqtt_client.publish(MQTT_TOPIC_COMPLETE, payload)
+                log("MQTT", "Sent Complete Signal")
+        except Exception as e:
+            log("MQTT", f"Complete Signal Error: {e}")
 
     def save_and_send_thread(self, image_array, rfid_data, req_id):
         try:
@@ -369,12 +439,10 @@ class SmartCaptureGizmo(dgstreams.Gizmo):
                 'status': 'return_complete',
                 'requestId': req_id
             }
-            
-            requests.post(SERVER_LINK, files=files, data=data, timeout=15.0, verify=False)
-            print(f"[{self.camera_name}] 전송 완료!")
-
+            self.session.post(SERVER_LINK, files=files, data=data, timeout=10.0)
+            log("UPLOAD", f"[{self.camera_name}] ✅ Success!")
         except Exception as e:
-            print(f"[{self.camera_name}] 전송 오류: {e}")
+            log("UPLOAD", f"[{self.camera_name}] ❌ Failed: {e}")
 
 # --- [메인 실행] ---
 configurations = [
@@ -399,9 +467,7 @@ pipeline = (
     (detector >> notifier >> display[di] for di, (detector, notifier) in enumerate(zip(detectors, notifiers))),
 )
 
-# [안전 종료 및 실행 관리]
 if __name__ == "__main__":
-    # 스레드 시작
     threads = []
     t_mqtt = threading.Thread(target=run_mqtt_thread, daemon=True)
     t_rfid = threading.Thread(target=rfid_reader_thread, daemon=True)
@@ -412,38 +478,30 @@ if __name__ == "__main__":
     threads.extend([t_mqtt, t_rfid, t_relay, t_pir, t_led])
     for t in threads: t.start()
 
-    print("==================================================")
-    print(f"🚀 시스템 가동! (Ctrl+C로 안전 종료 가능)")
-    print("==================================================")
+    log("MAIN", "🚀 System Started (Final Optimized Version)")
 
     pipeline_obj = dgstreams.Composition(*pipeline)
 
     try:
-        # 파이프라인 실행 (메인 스레드 점유)
         pipeline_obj.start()
-
     except KeyboardInterrupt:
-        print("\n\n🛑 [종료 요청] 시스템을 안전하게 종료합니다...")
+        log("MAIN", "🛑 Shutdown Requested")
         
-        # 1. 종료 이벤트 설정 (모든 while 루프 멈춤)
         stop_event.set()
         
-        # 2. 하드웨어 정리
+        log("MAIN", "Stopping Pipeline...")
+        pipeline_obj.stop() 
         
-        if buzzer:
-            buzzer.value = 0
-            print("   - 부저 꺼짐")
-            
+        for t in threads:
+            t.join(timeout=1.0)
+        
+        if pixels: pixels.fill((0,0,0)); pixels.show()
+        if buzzer: buzzer.value = 0
         relay.off()
-        print("   - 릴레이 꺼짐")
         
-        # 3. MQTT 연결 종료
         if mqtt_client:
-            try:
-                mqtt_client.disconnect()
-                print("   - MQTT 연결 해제")
+            try: mqtt_client.disconnect()
             except: pass
 
-        print("👋 안녕히 가세요! (5초 후 완전 종료)")
-        time.sleep(1) 
+        log("MAIN", "👋 Bye!")
         sys.exit(0)
